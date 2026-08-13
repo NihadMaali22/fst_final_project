@@ -40,7 +40,7 @@ export async function verifyApiKey(key) {
 }
 export async function authMiddleware(request, reply) {
     // GET /health is ALWAYS unauthenticated
-    if (request.routerPath === '/health' || request.url.startsWith('/health')) {
+    if (request.url === '/health' || request.url.startsWith('/health?')) {
         return;
     }
     // When AUTH_ENABLED=false, unrecognised or present Authorization headers must be ignored

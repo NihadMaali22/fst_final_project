@@ -42,7 +42,7 @@ export async function verifyApiKey(key: string): Promise<boolean> {
 
 export async function authMiddleware(request: FastifyRequest, reply: FastifyReply): Promise<void> {
   // GET /health is ALWAYS unauthenticated
-  if (request.routerPath === '/health' || request.url.startsWith('/health')) {
+  if (request.url === '/health' || request.url.startsWith('/health?')) {
     return;
   }
 

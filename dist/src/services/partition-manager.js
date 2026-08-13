@@ -54,7 +54,7 @@ export async function listPartitions() {
         pg_get_expr(c.relpartbound, c.oid) AS part_bound
       FROM pg_class c
       JOIN pg_inherits i ON i.inhrelid = c.oid
-      JOIN pg_class p ON p.oid = i.inhparentid
+      JOIN pg_class p ON p.oid = i.inhparent
       WHERE p.relname = 'logs'
       ORDER BY c.relname;
     `;
