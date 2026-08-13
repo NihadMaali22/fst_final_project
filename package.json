@@ -1,0 +1,32 @@
+{
+  "name": "log-ingestion-service",
+  "version": "1.0.0",
+  "description": "High-performance Log Ingestion and Query Service",
+  "main": "dist/src/index.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/src/index.js",
+    "dev": "tsx watch src/index.ts",
+    "test": "vitest run",
+    "test:unit": "vitest run tests/unit",
+    "test:integration": "vitest run tests/integration",
+    "test:smoke": "vitest run tests/smoke",
+    "load-test": "tsx scripts/load-test.ts"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "fastify": "^4.28.1",
+    "pg": "^8.12.0",
+    "pg-copy-streams": "^6.0.6"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.9",
+    "@types/pg": "^8.11.6",
+    "@types/pg-copy-streams": "^1.2.5",
+    "autocannon": "^7.15.0",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.2",
+    "vitest": "^1.6.0"
+  }
+}
