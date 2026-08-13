@@ -32,11 +32,27 @@ jobs:
       - name: Run Docker Compose (AUTH_ENABLED=false)
         run: |
           docker compose up -d --build
+          echo "Waiting for service to become healthy..."
+          for i in {1..30}; do
+            if curl -s http://localhost:8080/health | grep -q '"status":"ok"'; then
+              echo "Service is ready!"
+              break
+            fi
+            sleep 1
+          done
           npm run test:smoke || (docker compose logs && exit 1)
           docker compose down -v
 
       - name: Run Docker Compose (AUTH_ENABLED=true)
         run: |
           AUTH_ENABLED=true LOADGEN_API_KEY=ci-secret-key-123 docker compose up -d --build
-          npm run test:smoke || (docker compose logs && exit 1)
+          echo "Waiting for service to become healthy..."
+          for i in {1..30}; do
+            if curl -s http://localhost:8080/health | grep -q '"status":"ok"'; then
+              echo "Service is ready!"
+              break
+            fi
+            sleep 1
+          done
+          AUTH_ENABLED=true LOADGEN_API_KEY=ci-secret-key-123 npm run test:smoke || (docker compose logs && exit 1)
           docker compose down -v
