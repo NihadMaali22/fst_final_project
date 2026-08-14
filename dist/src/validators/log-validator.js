@@ -23,7 +23,7 @@ export function validateLogBatch(logs) {
             rejections.push({ index: i, reason: 'timestamp is more than 5 minutes in the future' });
             continue;
         }
-        // 2. Level validation (case-insensitive)
+        // 2. Level validation (case-insensitive: accepts "INFO", "Error", etc.)
         if (entry.level === undefined || entry.level === null) {
             rejections.push({ index: i, reason: 'missing required field: level' });
             continue;
@@ -47,12 +47,10 @@ export function validateLogBatch(logs) {
             rejections.push({ index: i, reason: 'missing required field: message' });
             continue;
         }
-        if (typeof entry.message !== 'string') {
-            rejections.push({ index: i, reason: 'message must be a string' });
+        if (typeof entry.message !== 'string' || entry.message.trim().length === 0) {
+            rejections.push({ index: i, reason: 'message must be a non-empty string' });
             continue;
         }
-        // Allow empty message strings — only reject non-string types
-        // Some specs allow empty messages; trim-check would be too restrictive
         // 5. Attributes validation
         let attributes = {};
         if (entry.attributes !== undefined && entry.attributes !== null) {

@@ -87,7 +87,7 @@ export async function executeAggregateLogs(params: AggregateParams): Promise<Agg
     queryValues.push(levelToSmallInt(levelStr));
   }
 
-  // 7. Filter: q
+  // 7. Filter: q (partition-pruned seq scan, no GIN index)
   if (params.q !== undefined) {
     if (typeof params.q !== 'string') {
       throw new AggregationValidationError("invalid 'q' parameter");
@@ -96,32 +96,17 @@ export async function executeAggregateLogs(params: AggregateParams): Promise<Agg
     queryValues.push(`%${params.q}%`);
   }
 
-  // 8. Filter: attr.<key>
+  // 8. Filter: attr.<key> — uses ->> text extraction (no GIN needed)
   for (const [key, value] of Object.entries(params)) {
     if (key.startsWith('attr.') && value !== undefined) {
       const attrKey = key.slice(5);
       if (attrKey.length === 0) {
         throw new AggregationValidationError("attribute key cannot be empty");
       }
-      // Try to parse value as number or boolean for JSON containment
-      let typedValue: string | number | boolean = String(value);
-      if (value === 'true') typedValue = true;
-      else if (value === 'false') typedValue = false;
-      else {
-        const num = Number(value);
-        if (!isNaN(num) && String(num) === String(value)) typedValue = num;
-      }
-
-      const jsonPattern = JSON.stringify({ [attrKey]: typedValue });
-      const stringJsonPattern = JSON.stringify({ [attrKey]: String(value) });
-      const p1 = paramIndex++;
-      const p2 = paramIndex++;
-      const p3 = paramIndex++;
-
-      whereClauses.push(
-        `(attributes @> $${p1}::jsonb OR attributes @> $${p2}::jsonb OR attributes->>$${p3} = '${String(value).replace(/'/g, "''")}')`
-      );
-      queryValues.push(jsonPattern, stringJsonPattern, attrKey);
+      const pKey = paramIndex++;
+      const pVal = paramIndex++;
+      whereClauses.push(`attributes->>$${pKey} = $${pVal}`);
+      queryValues.push(attrKey, String(value));
     }
   }
 

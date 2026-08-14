@@ -36,7 +36,7 @@ export function validateLogBatch(logs: RawLogEntry[]): ValidationResult {
       continue;
     }
 
-    // 2. Level validation (case-insensitive)
+    // 2. Level validation (case-insensitive: accepts "INFO", "Error", etc.)
     if (entry.level === undefined || entry.level === null) {
       rejections.push({ index: i, reason: 'missing required field: level' });
       continue;
@@ -66,13 +66,10 @@ export function validateLogBatch(logs: RawLogEntry[]): ValidationResult {
       continue;
     }
 
-    if (typeof entry.message !== 'string') {
-      rejections.push({ index: i, reason: 'message must be a string' });
+    if (typeof entry.message !== 'string' || entry.message.trim().length === 0) {
+      rejections.push({ index: i, reason: 'message must be a non-empty string' });
       continue;
     }
-
-    // Allow empty message strings — only reject non-string types
-    // Some specs allow empty messages; trim-check would be too restrictive
 
     // 5. Attributes validation
     let attributes: Record<string, string | number | boolean> = {};

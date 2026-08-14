@@ -71,7 +71,7 @@ export async function executeQueryLogs(params: QueryParams): Promise<QueryLogsRe
     throw new QueryValidationError("'until' must be later than 'since'");
   }
 
-  // 5. Message substring filter (q)
+  // 5. Message substring filter (q) — partition-pruned seq scan (no GIN index)
   if (params.q !== undefined) {
     if (typeof params.q !== 'string') {
       throw new QueryValidationError("invalid 'q' parameter");
@@ -81,32 +81,21 @@ export async function executeQueryLogs(params: QueryParams): Promise<QueryLogsRe
   }
 
   // 6. Attribute filters (attr.<key>)
+  // Uses text extraction (->> returns text for all JSON types) instead of @> containment.
+  // This doesn't need a GIN index and handles type coercion correctly:
+  //   stored 3 (number) → ->> returns '3' → matches query string '3' ✓
+  //   stored "3" (string) → ->> returns '3' → matches query string '3' ✓
+  //   stored true (boolean) → ->> returns 'true' → matches query string 'true' ✓
   for (const [key, value] of Object.entries(params)) {
     if (key.startsWith('attr.') && value !== undefined) {
       const attrKey = key.slice(5);
       if (attrKey.length === 0) {
         throw new QueryValidationError("attribute key cannot be empty");
       }
-      // Try to parse value as number or boolean for JSON containment
-      let typedValue: string | number | boolean = String(value);
-      if (value === 'true') typedValue = true;
-      else if (value === 'false') typedValue = false;
-      else {
-        const num = Number(value);
-        if (!isNaN(num) && String(num) === String(value)) typedValue = num;
-      }
-
-      const jsonPattern = JSON.stringify({ [attrKey]: typedValue });
-      const stringJsonPattern = JSON.stringify({ [attrKey]: String(value) });
-      const p1 = paramIndex++;
-      const p2 = paramIndex++;
-      const p3 = paramIndex++;
-
-      // Try containment with typed value, string value, and text extraction fallback
-      whereClauses.push(
-        `(attributes @> $${p1}::jsonb OR attributes @> $${p2}::jsonb OR attributes->>$${p3} = '${String(value).replace(/'/g, "''")}')`
-      );
-      queryValues.push(jsonPattern, stringJsonPattern, attrKey);
+      const pKey = paramIndex++;
+      const pVal = paramIndex++;
+      whereClauses.push(`attributes->>$${pKey} = $${pVal}`);
+      queryValues.push(attrKey, String(value));
     }
   }
 

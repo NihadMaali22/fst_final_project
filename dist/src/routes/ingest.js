@@ -1,4 +1,5 @@
 import { processIngestBatch } from '../services/ingestion.js';
+import { writeBuffer } from '../services/write-buffer.js';
 export async function ingestRoutes(app) {
     app.post('/logs', async (request, reply) => {
         const body = request.body;
@@ -11,7 +12,12 @@ export async function ingestRoutes(app) {
         if (body.logs.length === 0) {
             return reply.status(200).send({ accepted: 0 });
         }
-        const result = await processIngestBatch(body.logs);
+        // Backpressure: if the write buffer is overloaded, reject to prevent OOM
+        if (writeBuffer.isOverloaded()) {
+            return reply.status(429).send({ error: 'Server overloaded, try again later' });
+        }
+        // Synchronous: validate + enqueue (fire-and-forget), respond immediately
+        const result = processIngestBatch(body.logs);
         if (result.accepted === 0) {
             return reply.status(400).send(result);
         }

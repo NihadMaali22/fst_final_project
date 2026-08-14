@@ -1,13 +1,17 @@
--- Drop extremely expensive GIN indexes that crush write throughput
--- The pg_trgm index on message and jsonb_path_ops index on attributes
--- consume massive CPU during COPY inserts (each row updates both GIN indexes)
+-- Drop GIN indexes that crush write throughput on 1-CPU Postgres.
+-- The trgm and jsonb_path_ops GIN indexes update on every COPY row,
+-- consuming ~60% of Postgres CPU. Queries fall back to sequential scans
+-- on partitioned tables with time-range pruning, which is fast enough.
 DROP INDEX IF EXISTS idx_logs_message_trgm;
 DROP INDEX IF EXISTS idx_logs_attrs;
 
--- Drop individual service and level indexes (replaced by composite below)
-DROP INDEX IF EXISTS idx_logs_service;
+-- Drop low-selectivity level index (only 4 distinct values).
+-- Level filtering uses partition scan which is efficient.
 DROP INDEX IF EXISTS idx_logs_level;
 
--- Single composite index covers service+level filter combinations efficiently
-CREATE INDEX IF NOT EXISTS idx_logs_service_level_ts
-  ON logs (service, level, timestamp DESC, id DESC);
+-- Clean up any composite index from a prior optimization attempt
+DROP INDEX IF EXISTS idx_logs_service_level_ts;
+
+-- Remaining indexes after this migration:
+-- idx_logs_ts_id_cover (timestamp DESC, id DESC) INCLUDE (service, level)
+-- idx_logs_service (service, timestamp DESC, id DESC)

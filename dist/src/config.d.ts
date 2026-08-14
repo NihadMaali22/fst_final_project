@@ -10,4 +10,5 @@ export declare const config: {
     writeConcurrency: number;
     readPoolSize: number;
     writePoolSize: number;
+    maxBufferSize: number;
 };

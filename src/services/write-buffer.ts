@@ -2,11 +2,7 @@ import { from as copyFrom } from 'pg-copy-streams';
 import { writePool } from '../db/pool.js';
 import { ValidatedLogEntry } from '../models/types.js';
 import { config } from '../config.js';
-
-interface PendingBatchItem {
-  resolve: () => void;
-  reject: (err: Error) => void;
-}
+import { ensurePartition } from './partition-manager.js';
 
 function escapeCopyText(val: string): string {
   if (!val) return '';
@@ -19,55 +15,92 @@ function escapeCopyText(val: string): string {
 
 export class WriteBufferService {
   private queue: ValidatedLogEntry[] = [];
-  private pendingWaiters: PendingBatchItem[] = [];
   private timer: NodeJS.Timeout | null = null;
   private inFlightCount = 0;
 
-  async enqueue(entries: ValidatedLogEntry[]): Promise<void> {
+  /**
+   * Fire-and-forget: pushes entries into the queue and returns immediately.
+   * The HTTP response is decoupled from the COPY flush — no promise, no waiting.
+   * Background flushes drain the queue into Postgres via COPY.
+   */
+  enqueue(entries: ValidatedLogEntry[]): void {
     if (entries.length === 0) return;
-
-    return new Promise<void>((resolve, reject) => {
-      this.queue.push(...entries);
-      this.pendingWaiters.push({ resolve, reject });
-
-      if (this.queue.length >= config.writeFlushSize && this.inFlightCount < config.writeConcurrency) {
-        this.triggerFlush();
-      } else if (!this.timer) {
-        this.timer = setTimeout(() => {
-          this.timer = null;
-          this.triggerFlush();
-        }, config.writeFlushIntervalMs);
-      }
-    });
+    this.queue.push(...entries);
+    this.maybeFlush();
   }
 
-  private triggerFlush(): void {
+  /** Returns true if the in-memory buffer exceeds safe limits. */
+  isOverloaded(): boolean {
+    return this.queue.length >= config.maxBufferSize;
+  }
+
+  /** Returns current queue depth for monitoring. */
+  get queueSize(): number {
+    return this.queue.length;
+  }
+
+  private maybeFlush(): void {
+    // If queue reached batch size and we have concurrency headroom, flush now
+    if (this.queue.length >= config.writeFlushSize && this.inFlightCount < config.writeConcurrency) {
+      this.startFlush();
+    }
+    // Otherwise, schedule a timer-based flush if none is pending
+    else if (!this.timer && this.queue.length > 0) {
+      this.timer = setTimeout(() => {
+        this.timer = null;
+        this.startFlush();
+      }, config.writeFlushIntervalMs);
+    }
+  }
+
+  private startFlush(): void {
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
     }
-
     if (this.queue.length === 0) return;
     if (this.inFlightCount >= config.writeConcurrency) return;
 
-    const entriesToFlush = this.queue;
-    const waitersToNotify = this.pendingWaiters;
-    this.queue = [];
-    this.pendingWaiters = [];
+    // Take a bounded batch — NOT the entire queue.
+    // This prevents a single massive COPY that blocks Postgres for seconds during spikes.
+    const batchSize = Math.min(this.queue.length, config.writeFlushSize);
+    let entries: ValidatedLogEntry[];
+    if (batchSize === this.queue.length) {
+      entries = this.queue;
+      this.queue = [];
+    } else {
+      entries = this.queue.splice(0, batchSize);
+    }
+
     this.inFlightCount++;
 
-    this.executeCopyFlush(entriesToFlush, waitersToNotify).finally(() => {
-      this.inFlightCount--;
-      if (this.queue.length > 0) {
-        this.triggerFlush();
-      }
-    });
+    this.executeCopyFlush(entries)
+      .catch((err) => {
+        console.error('[WriteBuffer] COPY flush failed:', err instanceof Error ? err.message : err);
+      })
+      .finally(() => {
+        this.inFlightCount--;
+        // If there's still data in the queue, trigger another flush
+        if (this.queue.length > 0) {
+          this.maybeFlush();
+        }
+      });
   }
 
-  private async executeCopyFlush(entries: ValidatedLogEntry[], waiters: PendingBatchItem[]): Promise<void> {
-    let client;
+  private async executeCopyFlush(entries: ValidatedLogEntry[]): Promise<void> {
+    // 1. Ensure partitions exist for all dates in this batch (cache-hit is synchronous)
+    const uniqueDates = new Set<number>();
+    for (let i = 0; i < entries.length; i++) {
+      const d = entries[i].timestamp;
+      uniqueDates.add(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+    }
+    for (const utcMs of uniqueDates) {
+      await ensurePartition(new Date(utcMs));
+    }
+
+    // 2. COPY data into Postgres
+    const client = await writePool.connect();
     try {
-      client = await writePool.connect();
       const sql = 'COPY logs (timestamp, level, service, message, attributes) FROM STDIN WITH (FORMAT text)';
       const ingesterStream = client.query(copyFrom(sql));
 
@@ -75,39 +108,34 @@ export class WriteBufferService {
         ingesterStream.on('error', (err: Error) => reject(err));
         ingesterStream.on('finish', () => resolve());
 
-        // Build entire payload as a single string buffer to minimize stream.write() calls
+        // Build entire batch as a single string to minimize stream.write() syscalls
         const lines: string[] = new Array(entries.length);
         for (let i = 0; i < entries.length; i++) {
           const entry = entries[i];
           lines[i] = `${entry.timestampIso}\t${entry.level}\t${escapeCopyText(entry.service)}\t${escapeCopyText(entry.message)}\t${escapeCopyText(JSON.stringify(entry.attributes))}`;
         }
-
-        // Write as single chunk to reduce syscalls
-        const payload = lines.join('\n') + '\n';
-        ingesterStream.write(payload);
+        ingesterStream.write(lines.join('\n') + '\n');
         ingesterStream.end();
       });
-
-      for (let i = 0; i < waiters.length; i++) {
-        waiters[i].resolve();
-      }
-    } catch (err) {
-      const error = err instanceof Error ? err : new Error(String(err));
-      console.error('[WriteBuffer] COPY flush failed:', error.message);
-      for (let i = 0; i < waiters.length; i++) {
-        waiters[i].reject(error);
-      }
     } finally {
-      if (client) {
-        client.release();
-      }
+      client.release();
     }
   }
 
+  /** Drain all buffered entries. Called during graceful shutdown. */
   async flushAll(): Promise<void> {
+    // Cancel any pending timer
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+
+    // Flush remaining queue
     while (this.queue.length > 0 || this.inFlightCount > 0) {
-      this.triggerFlush();
-      await new Promise((r) => setTimeout(r, 10));
+      if (this.queue.length > 0 && this.inFlightCount < config.writeConcurrency) {
+        this.startFlush();
+      }
+      await new Promise((r) => setTimeout(r, 50));
     }
   }
 }
