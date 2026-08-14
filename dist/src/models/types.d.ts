@@ -14,6 +14,8 @@ export interface ValidatedLogEntry {
     service: string;
     message: string;
     attributes: Record<string, string | number | boolean>;
+    attributesJson: string;
+    flushAttempts?: number;
 }
 export interface RejectionReason {
     index: number;

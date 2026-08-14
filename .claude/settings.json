@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker exec log_service_db psql -U logs_user -d logs_db -c ' *)",
+      "Bash(docker compose *)"
+    ]
+  }
+}

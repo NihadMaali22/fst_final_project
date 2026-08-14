@@ -15,6 +15,31 @@ function getHeaders(customHeaders: Record<string, string> = {}) {
   return headers;
 }
 
+// Ingestion is eventually consistent (visible within the write-buffer flush cycle,
+// well under the service's 20s freshness SLA) rather than instantaneous, so reads
+// after a write must poll instead of asserting immediate visibility.
+async function pollForLogs(
+  url: string,
+  headers: Record<string, string>,
+  timeoutMs = 10_000,
+  intervalMs = 200
+): Promise<{ res: Response; body: any }> {
+  const deadline = Date.now() + timeoutMs;
+  let lastRes: Response;
+  let lastBody: any;
+  do {
+    lastRes = await fetch(url, { headers });
+    lastBody = await lastRes.json();
+    if (Array.isArray(lastBody.logs) && lastBody.logs.length > 0) {
+      return { res: lastRes, body: lastBody };
+    }
+    await new Promise((r) => setTimeout(r, intervalMs));
+  } while (Date.now() < deadline);
+  throw new Error(
+    `Timed out after ${timeoutMs}ms waiting for ingested log to become visible. Last response: ${JSON.stringify(lastBody)}`
+  );
+}
+
 describe('Smoke Contract Tests', () => {
   it('GET /health should return 200 OK without authentication', async () => {
     const res = await fetch(`${baseUrl}/health`);
@@ -48,17 +73,18 @@ describe('Smoke Contract Tests', () => {
     expect(body.accepted).toBe(1);
   });
 
-  it('GET /logs should return ingested logs', async () => {
-    const res = await fetch(`${baseUrl}/logs?service=smoke-service`, {
-      headers: getHeaders(),
-    });
+  it(
+    'GET /logs should return ingested logs',
+    async () => {
+      const { res, body } = await pollForLogs(`${baseUrl}/logs?service=smoke-service`, getHeaders());
 
-    expect(res.status).toBe(200);
-    const body = await res.json();
-    expect(Array.isArray(body.logs)).toBe(true);
-    expect(body.logs.length).toBeGreaterThan(0);
-    expect(body.logs[0].service).toBe('smoke-service');
-  });
+      expect(res.status).toBe(200);
+      expect(Array.isArray(body.logs)).toBe(true);
+      expect(body.logs.length).toBeGreaterThan(0);
+      expect(body.logs[0].service).toBe('smoke-service');
+    },
+    15_000
+  );
 
   it('GET /logs/aggregate should aggregate logs into buckets', async () => {
     const since = new Date(Date.now() - 3600_000).toISOString();

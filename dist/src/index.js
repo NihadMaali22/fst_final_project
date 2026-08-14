@@ -6,6 +6,13 @@ import { startRetentionScheduler, stopRetentionScheduler } from './services/rete
 import { writeBuffer } from './services/write-buffer.js';
 import { closePools } from './db/pool.js';
 import { buildApp } from './app.js';
+process.on('unhandledRejection', (reason) => {
+    console.error('[Process] Unhandled promise rejection:', reason);
+});
+process.on('uncaughtException', (err) => {
+    console.error('[Process] Uncaught exception:', err);
+    process.exit(1);
+});
 async function startServer() {
     try {
         console.log('[Server] Initializing Log Ingestion & Query Service...');

@@ -11,4 +11,5 @@ export declare const config: {
     readPoolSize: number;
     writePoolSize: number;
     maxBufferSize: number;
+    maxBufferBytes: number;
 };

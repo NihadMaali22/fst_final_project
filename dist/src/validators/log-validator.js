@@ -84,6 +84,7 @@ export function validateLogBatch(logs) {
             service: entry.service,
             message: entry.message,
             attributes,
+            attributesJson: JSON.stringify(attributes),
         });
     }
     return { validEntries, rejections };

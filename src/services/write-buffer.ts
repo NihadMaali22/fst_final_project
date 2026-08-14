@@ -13,10 +13,22 @@ function escapeCopyText(val: string): string {
     .replace(/\r/g, '\\r');
 }
 
+const MAX_FLUSH_RETRIES = 3;
+const RETRY_BACKOFF_BASE_MS = 250;
+const RETRY_BACKOFF_MAX_MS = 2000;
+const BYTES_PER_ENTRY_OVERHEAD = 96;
+
+function estimateEntryBytes(e: ValidatedLogEntry): number {
+  return e.message.length + e.service.length + e.attributesJson.length + BYTES_PER_ENTRY_OVERHEAD;
+}
+
 export class WriteBufferService {
   private queue: ValidatedLogEntry[] = [];
   private timer: NodeJS.Timeout | null = null;
   private inFlightCount = 0;
+  private queueBytes = 0;
+  private consecutiveFailures = 0;
+  private droppedEntryCount = 0;
 
   /**
    * Fire-and-forget: pushes entries into the queue and returns immediately.
@@ -26,17 +38,23 @@ export class WriteBufferService {
   enqueue(entries: ValidatedLogEntry[]): void {
     if (entries.length === 0) return;
     this.queue.push(...entries);
+    for (const e of entries) this.queueBytes += estimateEntryBytes(e);
     this.maybeFlush();
   }
 
-  /** Returns true if the in-memory buffer exceeds safe limits. */
+  /** Returns true if the in-memory buffer exceeds safe limits (item count or estimated bytes). */
   isOverloaded(): boolean {
-    return this.queue.length >= config.maxBufferSize;
+    return this.queue.length >= config.maxBufferSize || this.queueBytes >= config.maxBufferBytes;
   }
 
   /** Returns current queue depth for monitoring. */
   get queueSize(): number {
     return this.queue.length;
+  }
+
+  /** Returns count of entries permanently dropped after exhausting flush retries. */
+  get droppedCount(): number {
+    return this.droppedEntryCount;
   }
 
   private maybeFlush(): void {
@@ -71,17 +89,59 @@ export class WriteBufferService {
     } else {
       entries = this.queue.splice(0, batchSize);
     }
+    let batchBytes = 0;
+    for (const e of entries) batchBytes += estimateEntryBytes(e);
+    this.queueBytes -= batchBytes;
 
     this.inFlightCount++;
 
     this.executeCopyFlush(entries)
+      .then(() => {
+        this.consecutiveFailures = 0;
+      })
       .catch((err) => {
         console.error('[WriteBuffer] COPY flush failed:', err instanceof Error ? err.message : err);
+        this.consecutiveFailures++;
+
+        const retryable: ValidatedLogEntry[] = [];
+        for (const e of entries) {
+          const attempts = (e.flushAttempts ?? 0) + 1;
+          if (attempts <= MAX_FLUSH_RETRIES) {
+            e.flushAttempts = attempts;
+            retryable.push(e);
+          } else {
+            this.droppedEntryCount++;
+          }
+        }
+        if (retryable.length > 0) {
+          // Re-queue at the FRONT so retries are prioritized over newer arrivals.
+          // Bounded by the existing queue/isOverloaded() cap — no separate unbounded retry buffer.
+          this.queue.unshift(...retryable);
+          for (const e of retryable) this.queueBytes += estimateEntryBytes(e);
+        }
+        if (this.droppedEntryCount > 0) {
+          console.error(
+            `[WriteBuffer] Permanently dropped ${this.droppedEntryCount} entries total after exceeding ${MAX_FLUSH_RETRIES} retries`
+          );
+        }
       })
       .finally(() => {
         this.inFlightCount--;
-        // If there's still data in the queue, trigger another flush
-        if (this.queue.length > 0) {
+        if (this.queue.length === 0) return;
+
+        if (this.consecutiveFailures > 0) {
+          // Back off instead of hot-looping against a database that's still down.
+          const backoff = Math.min(
+            RETRY_BACKOFF_BASE_MS * 2 ** (this.consecutiveFailures - 1),
+            RETRY_BACKOFF_MAX_MS
+          );
+          if (!this.timer) {
+            this.timer = setTimeout(() => {
+              this.timer = null;
+              this.startFlush();
+            }, backoff);
+          }
+        } else {
           this.maybeFlush();
         }
       });
@@ -112,40 +172,13 @@ export class WriteBufferService {
         const lines: string[] = new Array(entries.length);
         for (let i = 0; i < entries.length; i++) {
           const entry = entries[i];
-          lines[i] = `${entry.timestampIso}\t${entry.level}\t${escapeCopyText(entry.service)}\t${escapeCopyText(entry.message)}\t${escapeCopyText(JSON.stringify(entry.attributes))}`;
+          lines[i] = `${entry.timestampIso}\t${entry.level}\t${escapeCopyText(entry.service)}\t${escapeCopyText(entry.message)}\t${escapeCopyText(entry.attributesJson)}`;
         }
         ingesterStream.write(lines.join('\n') + '\n');
         ingesterStream.end();
       });
     } finally {
       client.release();
-    }
-  }
-
-  /**
-   * Wait for any currently buffered data to be flushed to Postgres.
-   * Used by the read path (GET /logs, GET /logs/aggregate) to ensure
-   * read-after-write consistency without blocking the write path.
-   */
-  async waitForDrain(): Promise<void> {
-    if (this.queue.length === 0 && this.inFlightCount === 0) return;
-
-    // Trigger immediate flush of any pending data
-    if (this.queue.length > 0 && this.inFlightCount < config.writeConcurrency) {
-      this.startFlush();
-    }
-
-    // Wait until all in-flight COPY operations complete
-    while (this.inFlightCount > 0) {
-      await new Promise((r) => setTimeout(r, 5));
-    }
-
-    // If more data accumulated during the wait, flush that too
-    if (this.queue.length > 0) {
-      this.startFlush();
-      while (this.inFlightCount > 0) {
-        await new Promise((r) => setTimeout(r, 5));
-      }
     }
   }
 

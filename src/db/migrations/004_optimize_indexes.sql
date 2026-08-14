@@ -13,5 +13,5 @@ DROP INDEX IF EXISTS idx_logs_level;
 DROP INDEX IF EXISTS idx_logs_service_level_ts;
 
 -- Remaining indexes after this migration:
--- idx_logs_ts_id_cover (timestamp DESC, id DESC) INCLUDE (service, level)
+-- PRIMARY KEY (timestamp, id) [implicit btree per partition]
 -- idx_logs_service (service, timestamp DESC, id DESC)

@@ -114,18 +114,20 @@ export async function executeAggregateLogs(params: AggregateParams): Promise<Agg
 
   let selectGroupSql = 'NULL AS grp';
   let groupBySql = 'GROUP BY 1';
-  let orderBySql = 'ORDER BY 1 ASC';
 
   if (params.group_by === 'service') {
     selectGroupSql = 'service AS grp';
     groupBySql = 'GROUP BY 1, 2';
-    orderBySql = 'ORDER BY 1 ASC, 2 ASC';
   } else if (params.group_by === 'level') {
     selectGroupSql = 'level AS grp';
     groupBySql = 'GROUP BY 1, 2';
-    orderBySql = 'ORDER BY 1 ASC, 2 ASC';
   }
 
+  // Deliberately no ORDER BY here: an ORDER BY matching the GROUP BY key makes
+  // Postgres prefer a plan that sorts every matching row before grouping (GroupAggregate),
+  // rather than the far cheaper HashAggregate (grouping a ~month-wide scan into a
+  // couple dozen buckets). The result set is tiny (at most a few thousand buckets),
+  // so it's sorted in JS below instead of forcing a full-table sort in Postgres.
   const sql = `
     SELECT
       date_bin($${pInterval}::interval, timestamp, $${pOrigin}::timestamptz) AS bucket_start,
@@ -133,8 +135,7 @@ export async function executeAggregateLogs(params: AggregateParams): Promise<Agg
       COUNT(*)::bigint AS count
     FROM logs
     ${whereSql}
-    ${groupBySql}
-    ${orderBySql};
+    ${groupBySql};
   `;
 
   const client = await readPool.connect();
@@ -154,6 +155,15 @@ export async function executeAggregateLogs(params: AggregateParams): Promise<Agg
         group: groupVal,
         count: Number(row.count),
       };
+    });
+
+    buckets.sort((a, b) => {
+      const tsCompare = a.start < b.start ? -1 : a.start > b.start ? 1 : 0;
+      if (tsCompare !== 0) return tsCompare;
+      if (a.group === b.group) return 0;
+      if (a.group === null) return -1;
+      if (b.group === null) return 1;
+      return a.group < b.group ? -1 : 1;
     });
 
     return { buckets };

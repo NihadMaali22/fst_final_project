@@ -110,6 +110,7 @@ export function validateLogBatch(logs: RawLogEntry[]): ValidationResult {
       service: entry.service,
       message: entry.message,
       attributes,
+      attributesJson: JSON.stringify(attributes),
     });
   }
 
