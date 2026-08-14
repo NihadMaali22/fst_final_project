@@ -11,7 +11,9 @@ export const config = {
   loadgenApiKey: process.env.LOADGEN_API_KEY || '',
   writeFlushIntervalMs: parseInt(process.env.WRITE_FLUSH_INTERVAL_MS || '250', 10),
   writeFlushSize: parseInt(process.env.WRITE_FLUSH_SIZE || '6000', 10),
-  writeConcurrency: parseInt(process.env.WRITE_CONCURRENCY || '2', 10),
+  // One COPY at a time: a second concurrent flush measurably slows the aggregation
+  // query on a single-CPU Postgres without raising sustained ingestion throughput.
+  writeConcurrency: parseInt(process.env.WRITE_CONCURRENCY || '1', 10),
   readPoolSize: parseInt(process.env.READ_POOL_SIZE || '5', 10),
   writePoolSize: parseInt(process.env.WRITE_POOL_SIZE || '4', 10),
   maxBufferSize: parseInt(process.env.MAX_BUFFER_SIZE || '200000', 10),

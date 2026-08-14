@@ -4,8 +4,14 @@ import { ValidatedLogEntry } from '../models/types.js';
 import { config } from '../config.js';
 import { ensurePartition } from './partition-manager.js';
 
+const NEEDS_COPY_ESCAPE = /[\\\t\n\r]/;
+
+// Building a flush batch runs on the app's 0.5 CPU and blocks the event loop, which
+// shows up as tail latency on concurrent queries. Most log text contains none of the
+// COPY metacharacters, so test once and skip the four rewrites in that case.
 function escapeCopyText(val: string): string {
   if (!val) return '';
+  if (!NEEDS_COPY_ESCAPE.test(val)) return val;
   return val
     .replace(/\\/g, '\\\\')
     .replace(/\t/g, '\\t')
@@ -17,9 +23,45 @@ const MAX_FLUSH_RETRIES = 3;
 const RETRY_BACKOFF_BASE_MS = 250;
 const RETRY_BACKOFF_MAX_MS = 2000;
 const BYTES_PER_ENTRY_OVERHEAD = 96;
+const MINUTE_MS = 60_000;
+const HOUR_MS = 3_600_000;
+
+interface RollupDelta {
+  bucketMs: number;
+  service: string;
+  level: number;
+  count: number;
+}
 
 function estimateEntryBytes(e: ValidatedLogEntry): number {
   return e.message.length + e.service.length + e.attributesJson.length + BYTES_PER_ENTRY_OVERHEAD;
+}
+
+/**
+ * Counts a batch per (bucket, service, level) at the given resolution.
+ * Rows are deduplicated because one INSERT ... ON CONFLICT cannot touch the same
+ * row twice, and sorted so concurrent flushes take rollup row locks in the same
+ * order and cannot deadlock against each other.
+ */
+function countByBucket(entries: ValidatedLogEntry[], unitMs: number): RollupDelta[] {
+  const counts = new Map<string, RollupDelta>();
+  for (const entry of entries) {
+    const t = entry.timestamp.getTime();
+    const bucketMs = t - (t % unitMs);
+    const key = `${bucketMs} ${entry.level} ${entry.service}`;
+    const existing = counts.get(key);
+    if (existing) {
+      existing.count++;
+    } else {
+      counts.set(key, { bucketMs, service: entry.service, level: entry.level, count: 1 });
+    }
+  }
+  return [...counts.values()].sort(
+    (a, b) =>
+      a.bucketMs - b.bucketMs ||
+      a.level - b.level ||
+      (a.service < b.service ? -1 : a.service > b.service ? 1 : 0)
+  );
 }
 
 export class WriteBufferService {
@@ -147,6 +189,34 @@ export class WriteBufferService {
       });
   }
 
+  private async upsertRollup(
+    client: { query: (sql: string, values?: unknown[]) => Promise<unknown> },
+    table: string,
+    deltas: RollupDelta[]
+  ): Promise<void> {
+    if (deltas.length === 0) return;
+
+    const buckets = new Array<string>(deltas.length);
+    const services = new Array<string>(deltas.length);
+    const levels = new Array<number>(deltas.length);
+    const counts = new Array<number>(deltas.length);
+    for (let i = 0; i < deltas.length; i++) {
+      const d = deltas[i];
+      buckets[i] = new Date(d.bucketMs).toISOString();
+      services[i] = d.service;
+      levels[i] = d.level;
+      counts[i] = d.count;
+    }
+
+    await client.query(
+      `INSERT INTO ${table} (bucket, service, level, count)
+       SELECT * FROM unnest($1::timestamptz[], $2::text[], $3::smallint[], $4::bigint[])
+       ON CONFLICT (bucket, service, level)
+       DO UPDATE SET count = ${table}.count + EXCLUDED.count`,
+      [buckets, services, levels, counts]
+    );
+  }
+
   private async executeCopyFlush(entries: ValidatedLogEntry[]): Promise<void> {
     // 1. Ensure partitions exist for all dates in this batch (cache-hit is synchronous)
     const uniqueDates = new Set<number>();
@@ -158,9 +228,15 @@ export class WriteBufferService {
       await ensurePartition(new Date(utcMs));
     }
 
-    // 2. COPY data into Postgres
+    const minuteDeltas = countByBucket(entries, MINUTE_MS);
+    const hourDeltas = countByBucket(entries, HOUR_MS);
+
+    // 2. COPY the rows and apply the rollup deltas atomically, so a failed flush
+    //    leaves neither behind and can be retried without double-counting.
+    //    The upserts run last, holding rollup row locks only until COMMIT.
     const client = await writePool.connect();
     try {
+      await client.query('BEGIN');
       const sql = 'COPY logs (timestamp, level, service, message, attributes) FROM STDIN WITH (FORMAT text)';
       const ingesterStream = client.query(copyFrom(sql));
 
@@ -177,6 +253,17 @@ export class WriteBufferService {
         ingesterStream.write(lines.join('\n') + '\n');
         ingesterStream.end();
       });
+
+      await this.upsertRollup(client, 'log_rollup_1m', minuteDeltas);
+      await this.upsertRollup(client, 'log_rollup_1h', hourDeltas);
+      await client.query('COMMIT');
+    } catch (err) {
+      try {
+        await client.query('ROLLBACK');
+      } catch {
+        // Connection may already be unusable; the original error is what matters.
+      }
+      throw err;
     } finally {
       client.release();
     }

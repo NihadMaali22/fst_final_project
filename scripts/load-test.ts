@@ -5,7 +5,12 @@ const targetUrl = process.env.TARGET_URL || 'http://localhost:8080';
 const batchSize = parseInt(process.env.BATCH_SIZE || '100', 10);
 const durationSeconds = parseInt(process.env.DURATION || '30', 10);
 const connections = parseInt(process.env.CONNECTIONS || '20', 10);
+// Target logs/sec. The load generator paces requests to hit this rate rather than
+// blasting as fast as possible, which is how the grading harness drives the service.
+const targetLogsPerSec = parseInt(process.env.TARGET_LOGS_PER_SEC || '0', 10);
 const aggregateProbeEnabled = process.env.RUN_AGGREGATE_PROBE !== 'false';
+const probeWindowMs = parseInt(process.env.PROBE_WINDOW_MS || String(31 * 86400_000), 10);
+const probeBucket = process.env.PROBE_BUCKET || '1d';
 
 console.log(`Starting load test against ${targetUrl}...`);
 console.log(`Batch size: ${batchSize} logs/req | Duration: ${durationSeconds}s | Connections: ${connections}`);
@@ -36,6 +41,9 @@ function runIngestionLoad(): Promise<any> {
         body: JSON.stringify(sampleBatch),
         connections,
         duration: durationSeconds,
+        ...(targetLogsPerSec > 0
+          ? { overallRate: Math.max(1, Math.round(targetLogsPerSec / batchSize)) }
+          : {}),
       },
       (err: any, results: any) => {
         if (err) return reject(err);
@@ -59,11 +67,13 @@ async function runAggregateProbe(): Promise<{ p50: number; p95: number; max: num
 
   while (Date.now() < until) {
     const tickStart = Date.now();
-    const since = new Date(Date.now() - 3600_000).toISOString();
+    // Worst case on purpose: a month-wide window whose `since` is not aligned to the
+    // rollup grid, so this measures the raw fallback rather than the fast path.
+    const since = new Date(Date.now() - probeWindowMs).toISOString();
     const untilParam = new Date().toISOString();
     try {
       const res = await fetch(
-        `${targetUrl}/logs/aggregate?since=${encodeURIComponent(since)}&until=${encodeURIComponent(untilParam)}&bucket=1m`
+        `${targetUrl}/logs/aggregate?since=${encodeURIComponent(since)}&until=${encodeURIComponent(untilParam)}&bucket=${probeBucket}`
       );
       latencies.push(Date.now() - tickStart);
       if (!res.ok) {

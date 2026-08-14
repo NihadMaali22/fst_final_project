@@ -10,6 +10,18 @@ export class AggregationValidationError extends Error {
   }
 }
 
+const MINUTE_MS = 60_000;
+const HOUR_MS = 3_600_000;
+
+function floorToUnit(ms: number, unitMs: number): number {
+  return ms - (((ms % unitMs) + unitMs) % unitMs);
+}
+
+function ceilToUnit(ms: number, unitMs: number): number {
+  const floored = floorToUnit(ms, unitMs);
+  return floored === ms ? ms : floored + unitMs;
+}
+
 export async function executeAggregateLogs(params: AggregateParams): Promise<AggregateLogsResponse> {
   // 1. Required parameters check
   if (!params.since) {
@@ -49,32 +61,25 @@ export async function executeAggregateLogs(params: AggregateParams): Promise<Agg
     throw new AggregationValidationError(`invalid group_by: '${params.group_by}'. Supported: service, level`);
   }
 
-  const whereClauses: string[] = [];
   const queryValues: unknown[] = [];
-  let paramIndex = 1;
+  const bind = (value: unknown): string => {
+    queryValues.push(value);
+    return `$${queryValues.length}`;
+  };
 
   // Interval and origin parameters for date_bin
-  const pInterval = paramIndex++;
-  queryValues.push(pgInterval);
-  const pOrigin = paramIndex++;
-  queryValues.push(sinceDate.toISOString());
+  const pInterval = bind(pgInterval);
+  const pOrigin = bind(sinceDate.toISOString());
 
-  // Time range filter
-  const pSince = paramIndex++;
-  queryValues.push(sinceDate.toISOString());
-  whereClauses.push(`timestamp >= $${pSince}`);
-
-  const pUntil = paramIndex++;
-  queryValues.push(untilDate.toISOString());
-  whereClauses.push(`timestamp < $${pUntil}`);
+  // Dimension filters — these exist on the rollups too, so they never force a raw read.
+  const dimensionClauses: string[] = [];
 
   // 5. Filter: service
   if (params.service !== undefined) {
     if (typeof params.service !== 'string' || params.service.trim().length === 0) {
       throw new AggregationValidationError("service must be a non-empty string");
     }
-    whereClauses.push(`service = $${paramIndex++}`);
-    queryValues.push(params.service);
+    dimensionClauses.push(`service = ${bind(params.service)}`);
   }
 
   // 6. Filter: level (case-insensitive)
@@ -83,17 +88,18 @@ export async function executeAggregateLogs(params: AggregateParams): Promise<Agg
     if (!isValidLogLevel(levelStr)) {
       throw new AggregationValidationError(`unsupported log level: '${params.level}'`);
     }
-    whereClauses.push(`level = $${paramIndex++}`);
-    queryValues.push(levelToSmallInt(levelStr));
+    dimensionClauses.push(`level = ${bind(levelToSmallInt(levelStr))}`);
   }
+
+  // Message and attribute filters need the raw rows; rollups only store counts.
+  const rawOnlyClauses: string[] = [];
 
   // 7. Filter: q (partition-pruned seq scan, no GIN index)
   if (params.q !== undefined) {
     if (typeof params.q !== 'string') {
       throw new AggregationValidationError("invalid 'q' parameter");
     }
-    whereClauses.push(`message ILIKE $${paramIndex++}`);
-    queryValues.push(`%${params.q}%`);
+    rawOnlyClauses.push(`message ILIKE ${bind(`%${params.q}%`)}`);
   }
 
   // 8. Filter: attr.<key> — uses ->> text extraction (no GIN needed)
@@ -103,14 +109,126 @@ export async function executeAggregateLogs(params: AggregateParams): Promise<Agg
       if (attrKey.length === 0) {
         throw new AggregationValidationError("attribute key cannot be empty");
       }
-      const pKey = paramIndex++;
-      const pVal = paramIndex++;
-      whereClauses.push(`attributes->>$${pKey} = $${pVal}`);
-      queryValues.push(attrKey, String(value));
+      rawOnlyClauses.push(`attributes->>${bind(attrKey)} = ${bind(String(value))}`);
     }
   }
 
-  const whereSql = `WHERE ${whereClauses.join(' AND ')}`;
+  const rawSource = (fromMs: number, toMs: number): string => {
+    const clauses = [
+      `timestamp >= ${bind(new Date(fromMs).toISOString())}`,
+      `timestamp < ${bind(new Date(toMs).toISOString())}`,
+      ...rawOnlyClauses,
+    ];
+    return `SELECT timestamp AS ts, service, level, 1::bigint AS count FROM logs WHERE ${clauses.join(' AND ')}`;
+  };
+
+  // A rollup bucket can only be summed wholesale into an answer bucket when no requested
+  // boundary (since + k * interval) falls strictly inside it — otherwise its rows belong to
+  // two different answer buckets. Such "straddling" buckets are excluded here and re-read
+  // at a finer resolution below.
+  const cleanPredicate = (column: string, span: string): string =>
+    `date_bin(${pInterval}::interval, ${column}, ${pOrigin}::timestamptz) = ` +
+    `date_bin(${pInterval}::interval, ${column} + interval '${span}' - interval '1 microsecond', ${pOrigin}::timestamptz)`;
+
+  const rollupSource = (table: string, span: string, fromMs: number, toMs: number, mayStraddle: boolean): string => {
+    const clauses = [
+      `bucket >= ${bind(new Date(fromMs).toISOString())}`,
+      `bucket < ${bind(new Date(toMs).toISOString())}`,
+    ];
+    if (mayStraddle) clauses.push(cleanPredicate('bucket', span));
+    return `SELECT bucket AS ts, service, level, count FROM ${table} WHERE ${clauses.join(' AND ')}`;
+  };
+
+  // Re-reads the buckets excluded above at the next resolution down: straddling hours are
+  // refilled from per-minute rollups, straddling minutes from raw rows. Each straddling
+  // bucket is a narrow index range and there is at most one per answer bucket, so this
+  // stays cheap even when the newest bucket covers a heavy ingestion window.
+  const straddlingSource = (
+    outerSpan: string,
+    inner: { table: string; span: string } | null,
+    fromMs: number,
+    toMs: number
+  ): string => {
+    const pFrom = bind(new Date(fromMs).toISOString());
+    const pTo = bind(new Date(toMs).toISOString());
+    const pUntilBound = bind(untilDate.toISOString());
+    const straddling =
+      `SELECT DISTINCT date_bin(interval '${outerSpan}', b, TIMESTAMPTZ 'epoch') AS rb ` +
+      `FROM generate_series(${pOrigin}::timestamptz, ${pUntilBound}::timestamptz, ${pInterval}::interval) AS b ` +
+      `WHERE b <> date_bin(interval '${outerSpan}', b, TIMESTAMPTZ 'epoch')`;
+    const bounds = `d.rb >= ${pFrom} AND d.rb < ${pTo}`;
+    if (inner === null) {
+      // Only reached when no message/attribute filter is in play, so the join needs
+      // nothing beyond the time range.
+      return (
+        `SELECT l.timestamp AS ts, l.service AS service, l.level AS level, 1::bigint AS count ` +
+        `FROM (${straddling}) d JOIN logs l ` +
+        `ON l.timestamp >= d.rb AND l.timestamp < d.rb + interval '${outerSpan}' WHERE ${bounds}`
+      );
+    }
+    return (
+      `SELECT r.bucket AS ts, r.service AS service, r.level AS level, r.count AS count ` +
+      `FROM (${straddling}) d JOIN ${inner.table} r ` +
+      `ON r.bucket >= d.rb AND r.bucket < d.rb + interval '${outerSpan}' ` +
+      `WHERE ${bounds} AND ${cleanPredicate('r.bucket', inner.span)}`
+    );
+  };
+
+  const sinceMs = sinceDate.getTime();
+  const untilMs = untilDate.getTime();
+  const canUseRollup = rawOnlyClauses.length === 0;
+
+  // Coarsest-first: hour rollups carry most of a wide window, minute rollups patch the
+  // hours that straddle an answer boundary, and only the straddling minutes hit raw rows.
+  // Buckets below an hour skip the hour level; a 1m bucket on an unaligned window would
+  // straddle every minute, so it reads raw rows outright.
+  const useHourLevel = canUseRollup && (params.bucket === '1d' || params.bucket === '1h');
+  const useMinuteLevel =
+    canUseRollup && (useHourLevel || params.bucket === '5m' || sinceMs % MINUTE_MS === 0);
+
+  const hoursMayStraddle = sinceMs % HOUR_MS !== 0;
+  const minutesMayStraddle = sinceMs % MINUTE_MS !== 0;
+
+  const sources: string[] = [];
+  if (!useMinuteLevel) {
+    sources.push(rawSource(sinceMs, untilMs));
+  } else {
+    // Minute grid always applies; the hour grid sits inside it when enabled.
+    const minuteStart = Math.min(ceilToUnit(sinceMs, MINUTE_MS), untilMs);
+    const minuteEnd = Math.max(floorToUnit(untilMs, MINUTE_MS), minuteStart);
+
+    let hourStart = minuteStart;
+    let hourEnd = minuteStart;
+    if (useHourLevel) {
+      const h0 = Math.min(ceilToUnit(sinceMs, HOUR_MS), untilMs);
+      const h1 = Math.max(floorToUnit(untilMs, HOUR_MS), h0);
+      if (h1 > h0) {
+        hourStart = h0;
+        hourEnd = h1;
+        sources.push(rollupSource('log_rollup_1h', '1 hour', hourStart, hourEnd, hoursMayStraddle));
+        if (hoursMayStraddle) {
+          sources.push(
+            straddlingSource('1 hour', { table: 'log_rollup_1m', span: '1 minute' }, hourStart, hourEnd)
+          );
+        }
+      }
+    }
+
+    // Minutes outside the hour grid (its leading and trailing partial hours).
+    if (hourStart > minuteStart) {
+      sources.push(rollupSource('log_rollup_1m', '1 minute', minuteStart, hourStart, minutesMayStraddle));
+    }
+    if (minuteEnd > hourEnd) {
+      sources.push(rollupSource('log_rollup_1m', '1 minute', Math.max(hourEnd, minuteStart), minuteEnd, minutesMayStraddle));
+    }
+
+    // Sub-minute remainders at each end, plus any minute that straddles a boundary.
+    if (minuteStart > sinceMs) sources.push(rawSource(sinceMs, minuteStart));
+    if (untilMs > minuteEnd) sources.push(rawSource(minuteEnd, untilMs));
+    if (minutesMayStraddle && minuteEnd > minuteStart) {
+      sources.push(straddlingSource('1 minute', null, minuteStart, minuteEnd));
+    }
+  }
 
   let selectGroupSql = 'NULL AS grp';
   let groupBySql = 'GROUP BY 1';
@@ -123,18 +241,21 @@ export async function executeAggregateLogs(params: AggregateParams): Promise<Agg
     groupBySql = 'GROUP BY 1, 2';
   }
 
+  const filterSql = dimensionClauses.length > 0 ? `WHERE ${dimensionClauses.join(' AND ')}` : '';
+
   // Deliberately no ORDER BY here: an ORDER BY matching the GROUP BY key makes
   // Postgres prefer a plan that sorts every matching row before grouping (GroupAggregate),
-  // rather than the far cheaper HashAggregate (grouping a ~month-wide scan into a
-  // couple dozen buckets). The result set is tiny (at most a few thousand buckets),
-  // so it's sorted in JS below instead of forcing a full-table sort in Postgres.
+  // rather than the far cheaper HashAggregate. The result set is tiny (at most a few
+  // thousand buckets), so it's sorted in JS below instead.
   const sql = `
     SELECT
-      date_bin($${pInterval}::interval, timestamp, $${pOrigin}::timestamptz) AS bucket_start,
+      date_bin(${pInterval}::interval, ts, ${pOrigin}::timestamptz) AS bucket_start,
       ${selectGroupSql},
-      COUNT(*)::bigint AS count
-    FROM logs
-    ${whereSql}
+      SUM(count)::bigint AS count
+    FROM (
+      ${sources.join('\n      UNION ALL\n      ')}
+    ) AS parts
+    ${filterSql}
     ${groupBySql};
   `;
 
