@@ -122,6 +122,33 @@ export class WriteBufferService {
     }
   }
 
+  /**
+   * Wait for any currently buffered data to be flushed to Postgres.
+   * Used by the read path (GET /logs, GET /logs/aggregate) to ensure
+   * read-after-write consistency without blocking the write path.
+   */
+  async waitForDrain(): Promise<void> {
+    if (this.queue.length === 0 && this.inFlightCount === 0) return;
+
+    // Trigger immediate flush of any pending data
+    if (this.queue.length > 0 && this.inFlightCount < config.writeConcurrency) {
+      this.startFlush();
+    }
+
+    // Wait until all in-flight COPY operations complete
+    while (this.inFlightCount > 0) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+
+    // If more data accumulated during the wait, flush that too
+    if (this.queue.length > 0) {
+      this.startFlush();
+      while (this.inFlightCount > 0) {
+        await new Promise((r) => setTimeout(r, 5));
+      }
+    }
+  }
+
   /** Drain all buffered entries. Called during graceful shutdown. */
   async flushAll(): Promise<void> {
     // Cancel any pending timer

@@ -16,6 +16,12 @@ export declare class WriteBufferService {
     private maybeFlush;
     private startFlush;
     private executeCopyFlush;
+    /**
+     * Wait for any currently buffered data to be flushed to Postgres.
+     * Used by the read path (GET /logs, GET /logs/aggregate) to ensure
+     * read-after-write consistency without blocking the write path.
+     */
+    waitForDrain(): Promise<void>;
     /** Drain all buffered entries. Called during graceful shutdown. */
     flushAll(): Promise<void>;
 }
