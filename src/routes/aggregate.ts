@@ -6,8 +6,8 @@ import { writeBuffer } from '../services/write-buffer.js';
 export async function aggregateRoutes(app: FastifyInstance): Promise<void> {
   app.get('/logs/aggregate', async (request, reply) => {
     try {
-
-
+      // Ensure any buffered writes are flushed before reading
+      await writeBuffer.waitForDrain();
       const queryParams = request.query as AggregateParams;
       const response = await executeAggregateLogs(queryParams);
       return reply.status(200).send(response);
