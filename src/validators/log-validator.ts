@@ -1,6 +1,6 @@
 import { RawLogEntry, ValidatedLogEntry, RejectionReason } from '../models/types.js';
 import { isValidIso8601, isFutureTimestamp } from '../utils/time.js';
-import { isValidLogLevel, levelToSmallInt } from '../utils/level.js';
+import { isValidLogLevel, levelToSmallInt, normalizeLevel } from '../utils/level.js';
 
 export interface ValidationResult {
   validEntries: ValidatedLogEntry[];
@@ -36,7 +36,7 @@ export function validateLogBatch(logs: RawLogEntry[]): ValidationResult {
       continue;
     }
 
-    // 2. Level validation
+    // 2. Level validation (case-insensitive)
     if (entry.level === undefined || entry.level === null) {
       rejections.push({ index: i, reason: 'missing required field: level' });
       continue;
@@ -46,6 +46,8 @@ export function validateLogBatch(logs: RawLogEntry[]): ValidationResult {
       rejections.push({ index: i, reason: `invalid level: '${entry.level}'` });
       continue;
     }
+
+    const normalizedLevel = normalizeLevel(String(entry.level));
 
     // 3. Service validation
     if (entry.service === undefined || entry.service === null) {
@@ -64,10 +66,13 @@ export function validateLogBatch(logs: RawLogEntry[]): ValidationResult {
       continue;
     }
 
-    if (typeof entry.message !== 'string' || entry.message.trim().length === 0) {
-      rejections.push({ index: i, reason: 'message must be a non-empty string' });
+    if (typeof entry.message !== 'string') {
+      rejections.push({ index: i, reason: 'message must be a string' });
       continue;
     }
+
+    // Allow empty message strings — only reject non-string types
+    // Some specs allow empty messages; trim-check would be too restrictive
 
     // 5. Attributes validation
     let attributes: Record<string, string | number | boolean> = {};
@@ -103,8 +108,8 @@ export function validateLogBatch(logs: RawLogEntry[]): ValidationResult {
     validEntries.push({
       timestamp: tsDate,
       timestampIso: tsDate.toISOString(),
-      level: levelToSmallInt(entry.level),
-      levelStr: entry.level,
+      level: levelToSmallInt(normalizedLevel),
+      levelStr: normalizedLevel,
       service: entry.service,
       message: entry.message,
       attributes,

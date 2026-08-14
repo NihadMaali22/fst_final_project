@@ -8,6 +8,7 @@ export async function processIngestBatch(logs: RawLogEntry[]): Promise<IngestBat
 
   if (validEntries.length > 0) {
     // Ensure daily partitions exist for unique dates in this batch
+    // This is fast because ensurePartition uses an in-memory cache
     const uniqueDates = new Set<number>();
     for (let i = 0; i < validEntries.length; i++) {
       const d = validEntries[i].timestamp;
@@ -15,9 +16,12 @@ export async function processIngestBatch(logs: RawLogEntry[]): Promise<IngestBat
       uniqueDates.add(dateUtcDay);
     }
 
+    // Create partitions concurrently (non-blocking for common case where partition exists)
+    const partitionPromises: Promise<string>[] = [];
     for (const utcMs of uniqueDates) {
-      await ensurePartition(new Date(utcMs));
+      partitionPromises.push(ensurePartition(new Date(utcMs)));
     }
+    await Promise.all(partitionPromises);
 
     // Write valid logs to DB via writeBuffer
     await writeBuffer.enqueue(validEntries);

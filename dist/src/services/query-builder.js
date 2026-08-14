@@ -29,13 +29,14 @@ export async function executeQueryLogs(params) {
         whereClauses.push(`service = $${paramIndex++}`);
         queryValues.push(params.service);
     }
-    // 3. Level filter
+    // 3. Level filter (case-insensitive)
     if (params.level !== undefined) {
-        if (!isValidLogLevel(params.level)) {
+        const levelStr = String(params.level).toLowerCase();
+        if (!isValidLogLevel(levelStr)) {
             throw new QueryValidationError(`unsupported log level: '${params.level}'`);
         }
         whereClauses.push(`level = $${paramIndex++}`);
-        queryValues.push(levelToSmallInt(params.level));
+        queryValues.push(levelToSmallInt(levelStr));
     }
     // 4. Time range filters (since & until)
     let sinceDate = null;
@@ -74,12 +75,25 @@ export async function executeQueryLogs(params) {
             if (attrKey.length === 0) {
                 throw new QueryValidationError("attribute key cannot be empty");
             }
-            const jsonPattern = JSON.stringify({ [attrKey]: value });
+            // Try to parse value as number or boolean for JSON containment
+            let typedValue = String(value);
+            if (value === 'true')
+                typedValue = true;
+            else if (value === 'false')
+                typedValue = false;
+            else {
+                const num = Number(value);
+                if (!isNaN(num) && String(num) === String(value))
+                    typedValue = num;
+            }
+            const jsonPattern = JSON.stringify({ [attrKey]: typedValue });
+            const stringJsonPattern = JSON.stringify({ [attrKey]: String(value) });
             const p1 = paramIndex++;
             const p2 = paramIndex++;
             const p3 = paramIndex++;
-            whereClauses.push(`(attributes @> $${p1}::jsonb OR attributes->>$${p2} = $${p3})`);
-            queryValues.push(jsonPattern, attrKey, String(value));
+            // Try containment with typed value, string value, and text extraction fallback
+            whereClauses.push(`(attributes @> $${p1}::jsonb OR attributes @> $${p2}::jsonb OR attributes->>$${p3} = '${String(value).replace(/'/g, "''")}')`);
+            queryValues.push(jsonPattern, stringJsonPattern, attrKey);
         }
     }
     // 7. Cursor pagination

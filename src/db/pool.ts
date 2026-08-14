@@ -7,6 +7,7 @@ export const readPool = new Pool({
   max: config.readPoolSize,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 5000,
+  application_name: 'log_service_read',
 });
 
 export const writePool = new Pool({
@@ -14,6 +15,7 @@ export const writePool = new Pool({
   max: config.writePoolSize,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 5000,
+  application_name: 'log_service_write',
 });
 
 readPool.on('error', (err) => {

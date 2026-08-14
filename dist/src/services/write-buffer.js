@@ -62,16 +62,15 @@ export class WriteBufferService {
             await new Promise((resolve, reject) => {
                 ingesterStream.on('error', (err) => reject(err));
                 ingesterStream.on('finish', () => resolve());
+                // Build entire payload as a single string buffer to minimize stream.write() calls
+                const lines = new Array(entries.length);
                 for (let i = 0; i < entries.length; i++) {
                     const entry = entries[i];
-                    const tsStr = entry.timestampIso;
-                    const levelStr = entry.level.toString();
-                    const serviceStr = escapeCopyText(entry.service);
-                    const messageStr = escapeCopyText(entry.message);
-                    const attrsStr = escapeCopyText(JSON.stringify(entry.attributes));
-                    const line = `${tsStr}\t${levelStr}\t${serviceStr}\t${messageStr}\t${attrsStr}\n`;
-                    ingesterStream.write(line);
+                    lines[i] = `${entry.timestampIso}\t${entry.level}\t${escapeCopyText(entry.service)}\t${escapeCopyText(entry.message)}\t${escapeCopyText(JSON.stringify(entry.attributes))}`;
                 }
+                // Write as single chunk to reduce syscalls
+                const payload = lines.join('\n') + '\n';
+                ingesterStream.write(payload);
                 ingesterStream.end();
             });
             for (let i = 0; i < waiters.length; i++) {
@@ -80,7 +79,7 @@ export class WriteBufferService {
         }
         catch (err) {
             const error = err instanceof Error ? err : new Error(String(err));
-            console.error('[WriteBuffer] COPY flush failed:', error);
+            console.error('[WriteBuffer] COPY flush failed:', error.message);
             for (let i = 0; i < waiters.length; i++) {
                 waiters[i].reject(error);
             }

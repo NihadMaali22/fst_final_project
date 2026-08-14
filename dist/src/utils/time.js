@@ -6,9 +6,15 @@ export function isValidIso8601(str) {
     const d = new Date(str);
     if (isNaN(d.getTime()))
         return false;
-    // Additional ISO 8601 format check to ensure strict standard compliant strings
-    // ISO 8601 regex pattern matching YYYY-MM-DDTHH:mm:ss.sssZ or similar offset
-    const isoPattern = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?$/i;
+    // Accept broad ISO 8601 formats:
+    // YYYY-MM-DDTHH:mm:ss
+    // YYYY-MM-DDTHH:mm:ssZ
+    // YYYY-MM-DDTHH:mm:ss.sssZ
+    // YYYY-MM-DDTHH:mm:ss+HH:MM
+    // YYYY-MM-DDTHH:mm:ss.sss+HH:MM
+    // YYYY-MM-DDTHH:mm:ss+HHMM
+    // YYYY-MM-DDTHH:mm:ss.sss+HHMM
+    const isoPattern = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?$/i;
     return isoPattern.test(str);
 }
 export function isFutureTimestamp(date, maxFutureMs = 300_000) {

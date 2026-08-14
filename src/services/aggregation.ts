@@ -77,13 +77,14 @@ export async function executeAggregateLogs(params: AggregateParams): Promise<Agg
     queryValues.push(params.service);
   }
 
-  // 6. Filter: level
+  // 6. Filter: level (case-insensitive)
   if (params.level !== undefined) {
-    if (!isValidLogLevel(params.level)) {
+    const levelStr = String(params.level).toLowerCase();
+    if (!isValidLogLevel(levelStr)) {
       throw new AggregationValidationError(`unsupported log level: '${params.level}'`);
     }
     whereClauses.push(`level = $${paramIndex++}`);
-    queryValues.push(levelToSmallInt(params.level));
+    queryValues.push(levelToSmallInt(levelStr));
   }
 
   // 7. Filter: q
@@ -102,15 +103,25 @@ export async function executeAggregateLogs(params: AggregateParams): Promise<Agg
       if (attrKey.length === 0) {
         throw new AggregationValidationError("attribute key cannot be empty");
       }
-      const jsonPattern = JSON.stringify({ [attrKey]: value });
+      // Try to parse value as number or boolean for JSON containment
+      let typedValue: string | number | boolean = String(value);
+      if (value === 'true') typedValue = true;
+      else if (value === 'false') typedValue = false;
+      else {
+        const num = Number(value);
+        if (!isNaN(num) && String(num) === String(value)) typedValue = num;
+      }
+
+      const jsonPattern = JSON.stringify({ [attrKey]: typedValue });
+      const stringJsonPattern = JSON.stringify({ [attrKey]: String(value) });
       const p1 = paramIndex++;
       const p2 = paramIndex++;
       const p3 = paramIndex++;
 
       whereClauses.push(
-        `(attributes @> $${p1}::jsonb OR attributes->>$${p2} = $${p3})`
+        `(attributes @> $${p1}::jsonb OR attributes @> $${p2}::jsonb OR attributes->>$${p3} = '${String(value).replace(/'/g, "''")}')`
       );
-      queryValues.push(jsonPattern, attrKey, String(value));
+      queryValues.push(jsonPattern, stringJsonPattern, attrKey);
     }
   }
 

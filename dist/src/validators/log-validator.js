@@ -1,5 +1,5 @@
 import { isValidIso8601, isFutureTimestamp } from '../utils/time.js';
-import { isValidLogLevel, levelToSmallInt } from '../utils/level.js';
+import { isValidLogLevel, levelToSmallInt, normalizeLevel } from '../utils/level.js';
 export function validateLogBatch(logs) {
     const validEntries = [];
     const rejections = [];
@@ -23,7 +23,7 @@ export function validateLogBatch(logs) {
             rejections.push({ index: i, reason: 'timestamp is more than 5 minutes in the future' });
             continue;
         }
-        // 2. Level validation
+        // 2. Level validation (case-insensitive)
         if (entry.level === undefined || entry.level === null) {
             rejections.push({ index: i, reason: 'missing required field: level' });
             continue;
@@ -32,6 +32,7 @@ export function validateLogBatch(logs) {
             rejections.push({ index: i, reason: `invalid level: '${entry.level}'` });
             continue;
         }
+        const normalizedLevel = normalizeLevel(String(entry.level));
         // 3. Service validation
         if (entry.service === undefined || entry.service === null) {
             rejections.push({ index: i, reason: 'missing required field: service' });
@@ -46,10 +47,12 @@ export function validateLogBatch(logs) {
             rejections.push({ index: i, reason: 'missing required field: message' });
             continue;
         }
-        if (typeof entry.message !== 'string' || entry.message.trim().length === 0) {
-            rejections.push({ index: i, reason: 'message must be a non-empty string' });
+        if (typeof entry.message !== 'string') {
+            rejections.push({ index: i, reason: 'message must be a string' });
             continue;
         }
+        // Allow empty message strings — only reject non-string types
+        // Some specs allow empty messages; trim-check would be too restrictive
         // 5. Attributes validation
         let attributes = {};
         if (entry.attributes !== undefined && entry.attributes !== null) {
@@ -78,8 +81,8 @@ export function validateLogBatch(logs) {
         validEntries.push({
             timestamp: tsDate,
             timestampIso: tsDate.toISOString(),
-            level: levelToSmallInt(entry.level),
-            levelStr: entry.level,
+            level: levelToSmallInt(normalizedLevel),
+            levelStr: normalizedLevel,
             service: entry.service,
             message: entry.message,
             attributes,

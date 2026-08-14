@@ -6,12 +6,14 @@ export const readPool = new Pool({
     max: config.readPoolSize,
     idleTimeoutMillis: 30000,
     connectionTimeoutMillis: 5000,
+    application_name: 'log_service_read',
 });
 export const writePool = new Pool({
     connectionString: config.databaseUrl,
     max: config.writePoolSize,
     idleTimeoutMillis: 30000,
     connectionTimeoutMillis: 5000,
+    application_name: 'log_service_write',
 });
 readPool.on('error', (err) => {
     console.error('Unexpected error on idle read pool client', err);
