@@ -2,6 +2,7 @@ import { readPool } from '../db/pool.js';
 import { AggregateParams, AggregateLogsResponse, AggregateBucketOutput } from '../models/types.js';
 import { isValidIso8601, bucketToPostgresInterval } from '../utils/time.js';
 import { isValidLogLevel, levelToSmallInt, smallIntToLevel } from '../utils/level.js';
+import { config } from '../config.js';
 
 export class AggregationValidationError extends Error {
   constructor(message: string) {
@@ -67,9 +68,12 @@ export async function executeAggregateLogs(params: AggregateParams): Promise<Agg
     return `$${queryValues.length}`;
   };
 
-  // Interval and origin parameters for date_bin
+  // Interval and origin parameters for date_bin. A grid origin (epoch) puts every bucket
+  // boundary on a natural multiple of the interval, which is what the rollup tables are
+  // keyed on — so aggregations read pre-aggregated counts instead of scanning raw rows.
+  const gridAligned = config.aggregateAlignment === 'grid';
   const pInterval = bind(pgInterval);
-  const pOrigin = bind(sinceDate.toISOString());
+  const pOrigin = bind(gridAligned ? new Date(0).toISOString() : sinceDate.toISOString());
 
   // Dimension filters — these exist on the rollups too, so they never force a raw read.
   const dimensionClauses: string[] = [];
@@ -184,10 +188,13 @@ export async function executeAggregateLogs(params: AggregateParams): Promise<Agg
   // straddle every minute, so it reads raw rows outright.
   const useHourLevel = canUseRollup && (params.bucket === '1d' || params.bucket === '1h');
   const useMinuteLevel =
-    canUseRollup && (useHourLevel || params.bucket === '5m' || sinceMs % MINUTE_MS === 0);
+    canUseRollup && (gridAligned || useHourLevel || params.bucket === '5m' || sinceMs % MINUTE_MS === 0);
 
-  const hoursMayStraddle = sinceMs % HOUR_MS !== 0;
-  const minutesMayStraddle = sinceMs % MINUTE_MS !== 0;
+  // On the grid origin every supported bucket size is a whole multiple of the rollup
+  // grain, so no rollup bucket can span two answer buckets and the straddle correction
+  // is never needed. Only the sub-bucket remainders at each end come from raw rows.
+  const hoursMayStraddle = !gridAligned && sinceMs % HOUR_MS !== 0;
+  const minutesMayStraddle = !gridAligned && sinceMs % MINUTE_MS !== 0;
 
   const sources: string[] = [];
   if (!useMinuteLevel) {

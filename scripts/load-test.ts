@@ -102,11 +102,15 @@ async function runAggregateProbe(): Promise<{ p50: number; p95: number; max: num
 async function main() {
   const [ingestResults, aggregateResults] = await Promise.all([runIngestionLoad(), runAggregateProbe()]);
 
-  const totalLogsIngested = ingestResults.requests.total * batchSize;
+  // Count only accepted (2xx) requests: a 429 from backpressure carries no logs, so
+  // including it would report shed load as throughput.
+  const rejected = ingestResults.non2xx + ingestResults.errors;
+  const acceptedRequests = Math.max(0, ingestResults.requests.total - rejected);
+  const totalLogsIngested = acceptedRequests * batchSize;
   const logsPerSec = totalLogsIngested / durationSeconds;
 
   console.log('\n=== Ingestion Load Test Results ===');
-  console.log(`Total Requests: ${ingestResults.requests.total}`);
+  console.log(`Total Requests: ${ingestResults.requests.total} (accepted ${acceptedRequests}, rejected ${rejected})`);
   console.log(`Total Logs Ingested: ${totalLogsIngested}`);
   console.log(`Sustained Ingestion Rate: ${logsPerSec.toFixed(0)} logs/second`);
   console.log(`Latency p50: ${ingestResults.latency.p50} ms`);
