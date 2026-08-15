@@ -2,6 +2,7 @@ import { readPool } from '../db/pool.js';
 import { AggregateParams, AggregateLogsResponse, AggregateBucketOutput } from '../models/types.js';
 import { isValidIso8601, bucketToPostgresInterval } from '../utils/time.js';
 import { isValidLogLevel, levelToSmallInt, smallIntToLevel } from '../utils/level.js';
+import { buildAttributeContainmentSql } from '../utils/attr-filter.js';
 import { config } from '../config.js';
 
 export class AggregationValidationError extends Error {
@@ -106,14 +107,14 @@ export async function executeAggregateLogs(params: AggregateParams): Promise<Agg
     rawOnlyClauses.push(`message ILIKE ${bind(`%${params.q}%`)}`);
   }
 
-  // 8. Filter: attr.<key> — uses ->> text extraction (no GIN needed)
+  // 8. Filter: attr.<key> — containment so idx_logs_attrs (GIN) can be used
   for (const [key, value] of Object.entries(params)) {
     if (key.startsWith('attr.') && value !== undefined) {
       const attrKey = key.slice(5);
       if (attrKey.length === 0) {
         throw new AggregationValidationError("attribute key cannot be empty");
       }
-      rawOnlyClauses.push(`attributes->>${bind(attrKey)} = ${bind(String(value))}`);
+      rawOnlyClauses.push(buildAttributeContainmentSql(attrKey, String(value), bind));
     }
   }
 
@@ -161,20 +162,30 @@ export async function executeAggregateLogs(params: AggregateParams): Promise<Agg
       `FROM generate_series(${pOrigin}::timestamptz, ${pUntilBound}::timestamptz, ${pInterval}::interval) AS b ` +
       `WHERE b <> date_bin(interval '${outerSpan}', b, TIMESTAMPTZ 'epoch')`;
     const bounds = `d.rb >= ${pFrom} AND d.rb < ${pTo}`;
+    // The join bound comes from d.rb, which is a join key rather than a constant, so on
+    // its own it tells the planner nothing about which partitions can match and every
+    // partition in the table gets probed once per straddling bucket. These two extra
+    // predicates are implied by `bounds` plus the join condition — they add no rows and
+    // remove none — but being constant-based they let partition pruning cut the scan down
+    // to the requested window. Without them a month-wide unaligned window spends most of
+    // its time probing partitions that cannot contain a match.
+    const prune = (column: string): string =>
+      `${column} >= ${pFrom} AND ${column} < ${pTo}::timestamptz + interval '${outerSpan}'`;
     if (inner === null) {
       // Only reached when no message/attribute filter is in play, so the join needs
       // nothing beyond the time range.
       return (
         `SELECT l.timestamp AS ts, l.service AS service, l.level AS level, 1::bigint AS count ` +
         `FROM (${straddling}) d JOIN logs l ` +
-        `ON l.timestamp >= d.rb AND l.timestamp < d.rb + interval '${outerSpan}' WHERE ${bounds}`
+        `ON l.timestamp >= d.rb AND l.timestamp < d.rb + interval '${outerSpan}' ` +
+        `WHERE ${bounds} AND ${prune('l.timestamp')}`
       );
     }
     return (
       `SELECT r.bucket AS ts, r.service AS service, r.level AS level, r.count AS count ` +
       `FROM (${straddling}) d JOIN ${inner.table} r ` +
       `ON r.bucket >= d.rb AND r.bucket < d.rb + interval '${outerSpan}' ` +
-      `WHERE ${bounds} AND ${cleanPredicate('r.bucket', inner.span)}`
+      `WHERE ${bounds} AND ${prune('r.bucket')} AND ${cleanPredicate('r.bucket', inner.span)}`
     );
   };
 

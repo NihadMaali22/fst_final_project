@@ -1,12 +1,15 @@
 import { LogLevel } from '../models/types.js';
 
+// The contract admits exactly four levels. `warning` and `fatal` were previously mapped
+// as aliases of `warn` and `error`, which made isValidLogLevel accept them — so an entry
+// carrying `"level": "fatal"` was silently stored as `error` instead of being rejected
+// with a reason, and `?level=warning` was answered instead of returning 400. Aliases
+// belong nowhere in a validator whose job is to reject anything off-contract.
 const LEVEL_MAP: Record<string, number> = {
   debug: 0,
   info: 1,
   warn: 2,
-  warning: 2,
   error: 3,
-  fatal: 3,
 };
 
 const REVERSE_LEVEL_MAP: Record<number, LogLevel> = {

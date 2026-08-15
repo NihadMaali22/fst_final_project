@@ -2,6 +2,7 @@ import { readPool } from '../db/pool.js';
 import { QueryParams, QueryLogsResponse, FormattedLogOutput } from '../models/types.js';
 import { levelToSmallInt, smallIntToLevel, isValidLogLevel } from '../utils/level.js';
 import { isValidIso8601 } from '../utils/time.js';
+import { buildAttributeContainmentSql } from '../utils/attr-filter.js';
 import { decodeCursor, encodeCursor } from '../utils/cursor.js';
 
 export class QueryValidationError extends Error {
@@ -80,22 +81,20 @@ export async function executeQueryLogs(params: QueryParams): Promise<QueryLogsRe
     queryValues.push(`%${params.q}%`);
   }
 
-  // 6. Attribute filters (attr.<key>)
-  // Uses text extraction (->> returns text for all JSON types) instead of @> containment.
-  // This doesn't need a GIN index and handles type coercion correctly:
-  //   stored 3 (number) → ->> returns '3' → matches query string '3' ✓
-  //   stored "3" (string) → ->> returns '3' → matches query string '3' ✓
-  //   stored true (boolean) → ->> returns 'true' → matches query string 'true' ✓
+  // 6. Attribute filters (attr.<key>) — containment, backed by idx_logs_attrs (GIN).
+  // See buildAttributeContainmentSql for why this is equivalent to ->> extraction.
   for (const [key, value] of Object.entries(params)) {
     if (key.startsWith('attr.') && value !== undefined) {
       const attrKey = key.slice(5);
       if (attrKey.length === 0) {
         throw new QueryValidationError("attribute key cannot be empty");
       }
-      const pKey = paramIndex++;
-      const pVal = paramIndex++;
-      whereClauses.push(`attributes->>$${pKey} = $${pVal}`);
-      queryValues.push(attrKey, String(value));
+      whereClauses.push(
+        buildAttributeContainmentSql(attrKey, String(value), (v) => {
+          queryValues.push(v);
+          return `$${paramIndex++}`;
+        })
+      );
     }
   }
 

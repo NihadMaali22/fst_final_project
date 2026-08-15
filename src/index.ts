@@ -3,6 +3,7 @@ import { runMigrations } from './db/migrator.js';
 import { preCreatePartitions } from './services/partition-manager.js';
 import { seedLoadgenKey } from './middleware/auth.js';
 import { startRetentionScheduler, stopRetentionScheduler } from './services/retention.js';
+import { startIndexScheduler, stopIndexScheduler } from './services/index-manager.js';
 import { writeBuffer } from './services/write-buffer.js';
 import { closePools } from './db/pool.js';
 import { buildApp } from './app.js';
@@ -34,7 +35,10 @@ async function startServer(): Promise<void> {
     // 4. Start retention scheduler
     startRetentionScheduler();
 
-    // 5. Build and start Fastify app
+    // 5. Backfill message indexes on sealed partitions (runs in the background)
+    startIndexScheduler();
+
+    // 6. Build and start Fastify app
     const app = buildApp();
 
     await app.listen({ port: config.port, host: config.host });
@@ -44,6 +48,7 @@ async function startServer(): Promise<void> {
     const shutdown = async (signal: string) => {
       console.log(`[Server] Received ${signal}, starting graceful shutdown...`);
       stopRetentionScheduler();
+      stopIndexScheduler();
       await app.close();
       await writeBuffer.flushAll();
       await closePools();
